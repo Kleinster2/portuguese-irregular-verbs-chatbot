@@ -1,6 +1,7 @@
 import os
 import gradio as gr
 import openai
+import re
 
 # Use OpenAI v1+ client
 client = openai.OpenAI()  # Uses OPENAI_API_KEY from environment
@@ -33,9 +34,9 @@ SYSTEM_PROMPT = (
     "5. If the user's answer is correct except for missing accent marks (for example, 've' instead of 'vê', or 'estao' instead of 'estão'), do NOT mark it as fully incorrect. "
     "Instead, respond with: "
     "- 'Almost correct!' (or a similar encouraging phrase) "
-    "- Show the correct answer with accents." 
-    "- Briefly explain the importance of accents in Portuguese and encourage the user to try to include them." 
-    "- Do NOT penalize the user harshly for missing accents; focus on encouragement and education." 
+    "- Show the correct answer with accents."
+    "- Briefly explain the importance of accents in Portuguese and encourage the user to try to include them."
+    "- Do NOT penalize the user harshly for missing accents; focus on encouragement and education."
     "Example: If the correct answer is 'vê' and the user types 've', respond: 'Almost correct! The correct answer is 'vê' (with an accent on 'e'). In Portuguese, accents are important because they change the meaning and pronunciation of words. Try to include the accent next time!'"
     "6. If the user's answer is a valid conjugation of the verb but in the wrong tense (for example, 'pode' instead of 'pôde'), explain the difference in tense, show the correct answer, and encourage the user to pay attention to tense as well as accents. "
     "Example: If the correct answer is 'pôde' (past) and the user types 'pode' (present), respond: 'Not quite! 'Pode' is the present tense, but here you need the past tense: 'pôde' (with an accent). In Portuguese, tense and accents are important for meaning. Keep practicing!'"
@@ -45,256 +46,162 @@ SYSTEM_PROMPT = (
     "Example: If the sentence is 'Durante as férias, eu ____ à casa dos meus avós todos os dias.' and the user types 'fui', respond: 'Not quite! 'Fui' is the preterite (a single completed action), but here the imperfect 'ia' is used because it describes a habitual action in the past ('I used to go'). In Portuguese, the imperfect tense is for repeated or ongoing actions in the past. Great job trying—keep an eye out for these distinctions!'"
 )
 
-# Keep chat history in memory for session continuity
-chat_history = []
-asked_questions = set()
-
-# Helper to build the prompt for the LLM
-def build_prompt(history, user_message):
-    prompt = SYSTEM_PROMPT + "\n\n"
-    for turn in history:
-        prompt += f"User: {turn['user']}\nTrainer: {turn['bot']}\n"
-    prompt += f"User: {user_message}\nTrainer:"
-    return prompt
-
-# Gradio handler
 TRIGGER_MESSAGE = "Please start the session with a fill-in-the-blank sentence."
 
-def llm_chatbot(user_message, history):
-    global chat_history, asked_questions
+# --- Helper function definitions --- START ---
+ALLOWED_IRREGULAR_VERB_ROOTS = [
+    "ser", "estar", "ir", "ter", "fazer", "dizer", "ver", "vir",
+    "poder", "querer", "saber", "trazer", "dar", "pôr"
+]
+VERB_IDENTIFICATION_PATTERN = re.compile(r"The missing verb is '(\w+)' \(to ", re.IGNORECASE)
+PROPOSED_ANSWER_PATTERN = re.compile(r"The correct answer (?:is|would be) '([^']+)'", re.IGNORECASE)
+COMPOUND_INDICATOR_WORDS = [
+    "tinha", "havia", "teria", "houvera", "hei de", "vou", "vai", "vamos", "vão", 
+    "sido", "estado", "ido", "tido", "feito", "dito", "visto", "vindo",
+    "podido", "querido", "sabido", "trazido", "dado", "posto",
+    "past perfect", "pluperfect", "future perfect", "compound tense",
+    "would have been", "could have been", "passive voice"
+]
+
+def contains_regular_verb(bot_response_text):
+    match = VERB_IDENTIFICATION_PATTERN.search(bot_response_text)
+    if match:
+        identified_verb_root = match.group(1).lower()
+        if identified_verb_root not in ALLOWED_IRREGULAR_VERB_ROOTS:
+            return identified_verb_root
+    if re.search(r"apologize(?:d|s)? for using a regular verb", bot_response_text, re.IGNORECASE):
+        return "explicit_apology_for_regular"
+    return None
+
+def contains_compound_verb(bot_response_text):
+    match = PROPOSED_ANSWER_PATTERN.search(bot_response_text)
+    if match:
+        answer = match.group(1)
+        if ' ' in answer.strip():
+            return answer
+    if re.search(r"apologize(?:d|s)? for using a compound verb", bot_response_text, re.IGNORECASE):
+        return "explicit_apology_for_compound"
+    return None
+
+def explanation_has_compound_ambiguity(bot_response_text):
+    if re.search(r"(better|more natural|more appropriate|also correct)(?: answer| fit| form| option)? (?:would be|is|might be) [\w\s]*(" + '|'.join(COMPOUND_INDICATOR_WORDS) + r")", bot_response_text, re.IGNORECASE):
+        return True
+    if re.search(r"should not have used this sentence because a compound.*? more natural", bot_response_text, re.IGNORECASE):
+        return True
+    return None
+# --- Helper function definitions --- END ---
+
+# --- Core Chatbot Logic --- START ---
+def llm_chatbot(user_message, current_gradio_chat_history):
     if not os.getenv("OPENAI_API_KEY"):
-        print("[DEBUG] OPENAI_API_KEY not set in environment.")
-        error_msg = "Error: OPENAI_API_KEY not set in environment. Please set your OpenAI API key and restart the app."
-        error_history = [{"role": "assistant", "content": error_msg}]
-        return error_msg, error_history
+        return "", [{"role": "assistant", "content": "Error: OPENAI_API_KEY not set."}]
 
-    # Reconstruct chat_history from Gradio's history format (preserve all prior turns)
-    chat_history = []
-    for pair in history:
-        if isinstance(pair, dict) and "role" in pair and "content" in pair:
-            if pair["role"] == "user":
-                chat_history.append({"user": pair["content"]})
-            elif pair["role"] == "assistant":
-                # If last is user, pair it; else, append new
-                if chat_history and "user" in chat_history[-1] and "bot" not in chat_history[-1]:
-                    chat_history[-1]["bot"] = pair["content"]
-                else:
-                    chat_history.append({"bot": pair["content"]})
-        elif isinstance(pair, (list, tuple)) and len(pair) == 2:
-            chat_history.append({"user": pair[0], "bot": pair[1]})
+    messages_for_api = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if current_gradio_chat_history:
+        messages_for_api.extend(current_gradio_chat_history)
+    
+    if user_message != TRIGGER_MESSAGE or current_gradio_chat_history:
+        messages_for_api.append({"role": "user", "content": user_message})
+    elif user_message == TRIGGER_MESSAGE and not current_gradio_chat_history:
+        messages_for_api.append({"role": "user", "content": TRIGGER_MESSAGE})
 
-    # Now, handle the new user_message
-    if user_message:
-        # If last is assistant, append user's answer
-        if chat_history and "bot" in chat_history[-1] and "user" not in chat_history[-1]:
-            chat_history[-1]["user"] = user_message
-        else:
-            chat_history.append({"user": user_message})
-
-    # Guarantee at least system prompt and user message for the initial call
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    # If there is no chat history, this is the first call: trigger with TRIGGER_MESSAGE
-    if not history or len(history) == 0:
-        messages.append({"role": "user", "content": TRIGGER_MESSAGE})
-    else:
-        # Reconstruct alternating assistant/user turns
-        for turn in chat_history:
-            if "bot" in turn:
-                messages.append({"role": "assistant", "content": turn["bot"]})
-            if "user" in turn:
-                messages.append({"role": "user", "content": turn["user"]})
-
+    print(f"[DEBUG] OpenAI API call - messages: {messages_for_api}")
     try:
-        print("[DEBUG] OpenAI API call - model: gpt-4o")
-        print(f"[DEBUG] OpenAI API call - messages: {messages}")
         response = client.chat.completions.create(
             model="gpt-4o",
-            messages=messages,
-            max_tokens=200,
+            messages=messages_for_api,
+            max_tokens=300,
             temperature=0.7,
         )
-
-        print(f"[DEBUG] OpenAI API raw response: {response}")
-        import re
-        # --- Build Gradio chatbot history for full session display ---
-        # Get the LLM's reply
-        if hasattr(response, 'choices') and response.choices and hasattr(response.choices[0], 'message'):
-            bot_reply = response.choices[0].message.content.strip()
-        else:
-            bot_reply = "[Error: No response from LLM]"
-
-        # Build new Gradio history
-        gradio_history = []
-        if not history or len(history) == 0:
-            # Initial question: show as ("", exercise)
-            gradio_history.append(("", bot_reply))
-        else:
-            # Copy prior history (as (user, assistant) tuples)
-            for pair in history:
-                if isinstance(pair, dict):
-                    # Convert OpenAI-style dicts to tuples
-                    if pair.get("role") == "user":
-                        last_user = pair["content"]
-                    elif pair.get("role") == "assistant":
-                        last_assistant = pair["content"]
-                        gradio_history.append((last_user if 'last_user' in locals() else "", last_assistant))
-                        last_user = ""
-                elif isinstance(pair, (list, tuple)) and len(pair) == 2:
-                    gradio_history.append((pair[0], pair[1]))
-            # Add the new user answer and LLM reply
-            if user_message:
-                gradio_history.append((user_message, bot_reply))
-
-        # Continue with the rest of the logic (filtering, etc.)
-        # Helper: List of common regular verbs (expandable)
-        REGULAR_VERBS_PT = [
-            "amar", "andar", "aprender", "beber", "cantar", "chegar", "comprar", "comer", "dançar", "decidir", "estudar", "falar", "gostar", "jogar", "lavar", "levar", "morar", "nadar", "olhar", "parar", "partir", "pensar", "perguntar", "procurar", "receber", "trabalhar", "usar", "vender", "viajar", "visitar", "entender", "abrir", "assistir", "existir", "dividir", "obedecer", "permitir", "prometer", "responder", "servir", "subir", "unir", "viver"
-        ]
-        def contains_regular_verb(text):
-            for verb in REGULAR_VERBS_PT:
-                # Look for the infinitive or a blank with the verb name nearby
-                if re.search(rf'\b{verb}\b', text, re.IGNORECASE):
-                    return verb
-            return None
-
-        def extract_expected_answer(text):
-            # Try to extract the answer from the explanation
-            match = re.search(r"(?:correct answer|missing verb) (?:is|are|:)\s*['\"]?([\wÀ-ÿ]+)['\"]?", text, re.IGNORECASE)
-            if match:
-                return match.group(1)
-            # Fallback: look for a verb at the end of the explanation
-            lines = text.split('\n')
-            for line in lines:
-                if 'verb' in line.lower() or 'answer' in line.lower():
-                    words = re.findall(r'\b([\wÀ-ÿ]+)\b', line)
-                    if words:
-                        return words[-1]
-            return None
-
-        def contains_compound_verb(text):
-            answer = extract_expected_answer(text)
-            print(f"[DEBUG] Extracted answer for compound check: {answer}")
-            if answer and ' ' in answer.strip():
-                return True
-            return False
-
-        # Heuristic: If the explanation contains signs of compound ambiguity, treat as ambiguous
-        def explanation_has_compound_ambiguity(text):
-            # Only flag as ambiguous if the LLM explanation or translation suggests a compound is better/more natural
-            preferred_compound_keywords = [
-                "should have", "would have", "had already", "has been", "have been", "had been", "would be better", "the best answer is", "the most natural answer is", "preferred answer", "more natural answer", "would be more correct", "most appropriate answer", "a better answer would be", "more appropriate answer"
-            ]
-            lowered = text.lower()
-            for kw in preferred_compound_keywords:
-                if kw in lowered:
-                    return True
-            return False
+        bot_reply_content = response.choices[0].message.content.strip() if response.choices else "[Error: No response from LLM]"
 
         retry_count = 0
-        max_retries = 10  # Higher cap, no user-facing error
-        valid_exercise = False
+        max_retries = 3
         while retry_count < max_retries:
-            if hasattr(response, 'choices') and response.choices and hasattr(response.choices[0], 'message'):
-                bot_reply = response.choices[0].message.content.strip()
-                regular_found = contains_regular_verb(bot_reply)
-                compound_found = contains_compound_verb(bot_reply)
-                ambiguous_explanation = explanation_has_compound_ambiguity(bot_reply)
-                if regular_found or compound_found or ambiguous_explanation:
-                    print(f"[DEBUG] Regular, compound, or ambiguous answer detected in LLM response: regular={regular_found}, compound={compound_found}, ambiguous={ambiguous_explanation}")
-                    # Ask the LLM again for a new exercise
-                    retry_prompt = "You used a "
-                    if regular_found:
-                        retry_prompt += f"regular verb ('{regular_found}')"
-                    if compound_found:
-                        retry_prompt += (" and " if regular_found else "") + "a compound verb or phrase (the answer must be a single, simple, irregular verb form)"
-                    if ambiguous_explanation:
-                        retry_prompt += (" and " if (regular_found or compound_found) else "") + "an ambiguous or compound-possible answer (the answer must be a single, simple, irregular verb with no possible compound alternative)"
-                    retry_prompt += ". Please apologize and immediately generate a new fill-in-the-blank exercise using a single, simple, irregular verb only, where no compound form could also be correct."
-                    response = client.chat.completions.create(
-                        model="gpt-4o",
-                        messages=messages + [{"role": "user", "content": retry_prompt}],
-                        max_tokens=200,
-                        temperature=0.7,
-                    )
-                    retry_count += 1
-                    continue
-                # If we get here, the exercise is valid
-                chat_history[-1]["bot"] = bot_reply
-                valid_exercise = True
+            regular_found = contains_regular_verb(bot_reply_content)
+            compound_found = contains_compound_verb(bot_reply_content)
+            ambiguous_explanation = explanation_has_compound_ambiguity(bot_reply_content)
+            if not (regular_found or compound_found or ambiguous_explanation):
                 break
-            else:
-                print(f"[DEBUG] OpenAI API response missing expected fields: {response}")
-                retry_count += 1
-                continue
-        # Only show a question if valid_exercise is True
-        if not valid_exercise:
-            print(f"[DEBUG] LLM failed to generate a valid exercise after {max_retries} retries. No message shown to user.")
-            return "", []
+            
+            print(f"[DEBUG] Invalid exercise. Retrying ({retry_count+1}/{max_retries})...")
+            retry_prompt = "You previously generated an exercise that was not suitable. Please apologize and generate a new, different exercise strictly using one of the allowed single-word irregular verbs."
+            
+            retry_api_messages = messages_for_api + [{"role": "assistant", "content": bot_reply_content}, {"role": "user", "content": retry_prompt}]
+            
+            new_response = client.chat.completions.create(
+                model="gpt-4o", messages=retry_api_messages, max_tokens=300, temperature=0.7 + (retry_count * 0.05)
+            )
+            bot_reply_content = new_response.choices[0].message.content.strip() if new_response.choices else "[Error: No response on retry]"
+            retry_count += 1
+        
+        new_gradio_chat_history = list(current_gradio_chat_history)
+        if user_message == TRIGGER_MESSAGE and not current_gradio_chat_history:
+            new_gradio_chat_history = [{"role": "assistant", "content": bot_reply_content}]
+        else:
+            new_gradio_chat_history.append({"role": "user", "content": user_message})
+            new_gradio_chat_history.append({"role": "assistant", "content": bot_reply_content})
+        
+        print(f"[DEBUG] llm_chatbot returning: '', {new_gradio_chat_history}")
+        return "", new_gradio_chat_history
 
-        # Remove the trigger message from history after the first LLM response
-        chat_history = [turn for turn in chat_history if turn.get("user") != TRIGGER_MESSAGE]
-
-        # Convert back to Gradio format (OpenAI-style dictionaries)
-        gradio_history = []
-        for turn in chat_history:
-            if "user" in turn:
-                gradio_history.append({"role": "user", "content": turn["user"]})
-            if "bot" in turn:
-                gradio_history.append({"role": "assistant", "content": turn["bot"]})
-        # If for any reason the history is empty but we have a bot_reply, add it as the first message
-        if not gradio_history and bot_reply:
-            gradio_history = [{"role": "assistant", "content": bot_reply}]
-        print(f"[DEBUG] llm_chatbot() returning: '', {gradio_history}")
-        return "", gradio_history
     except Exception as e:
-        print(f"[DEBUG] llm_chatbot() exception: {str(e)}")
+        print(f"[DEBUG] llm_chatbot exception: {str(e)}")
         import traceback
         traceback.print_exc()
-        # Return error in OpenAI-style format for chat UI
-        error_msg = f"Error accessing OpenAI API: {str(e)}"
-        error_history = [{"role": "assistant", "content": error_msg}]
-        return error_msg, error_history
+        return "", [{"role": "assistant", "content": f"Error: {str(e)}"}]
+
+def initial_llm():
+    print("[DEBUG] initial_llm() called for Chatbot value param")
+    _, initial_history_for_gradio = llm_chatbot(TRIGGER_MESSAGE, [])
+    print(f"[DEBUG] initial_llm() returning for Gradio: {initial_history_for_gradio}")
+    return initial_history_for_gradio
 
 def reset_chat():
-    global chat_history, asked_questions
-    chat_history = []
-    asked_questions = set()
-    initial_message = "Vamos começar! Conjugue o verbo 'ser' para a pessoa 'eu'."
-    return "", [["", initial_message]]
+    print("[DEBUG] reset_chat() called")
+    _, new_initial_history = llm_chatbot(TRIGGER_MESSAGE, [])
+    return "", new_initial_history
+# --- Core Chatbot Logic --- END ---
 
-def reset_ui():
-    reset_msg, reset_history = reset_chat()
-    return reset_msg, reset_history
+# --- Gradio Interface --- START ---
+BOT_AVATAR_URL = "https://img.icons8.com/color/48/brazil-circular.png"
 
-# On app load, trigger the LLM to generate the first exercise
-def initial_llm():
-    # Generate the first LLM message and store it as history
-    # Use a special message to trigger the first question
-    initial_user = "Please start the session with a fill-in-the-blank sentence."
-    print("[DEBUG] Calling llm_chatbot from initial_llm()...")
-    msg, history = llm_chatbot(initial_user, [])
-    print(f"[DEBUG] initial_llm() msg: {msg}")
-    print(f"[DEBUG] initial_llm() history: {history}")
-    # If there's an error or no valid exercise, do not show any error to the user—just return empty history
-    if not history or len(history) == 0:
-        print("[DEBUG] initial_llm() fallback: history is empty after initialization. No message shown to user.")
-        return "", []
-    return "", history
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("## Brazilian Portuguese Irregular Verb Trainer")
+    gr.Markdown("Practice filling in the blanks with the correct verb form!")
 
-with gr.Blocks() as demo:
-    gr.Markdown("# Brazilian Portuguese Irregular Verb Trainer\nPractice filling in the blanks with the correct verb form!")
-    chatbot = gr.Chatbot(type="messages")
+    chatbot_component = gr.Chatbot(
+        value=initial_llm(), # initial_llm returns List[Dict[role, content]]
+        label="Chatbot",
+        bubble_full_width=False,
+        avatar_images=(None, BOT_AVATAR_URL),
+        show_label=False,
+        layout="panel", # Using panel layout often works better with type="messages"
+        type="messages" # Explicitly set type to messages
+    )
+
     with gr.Row():
-        msg = gr.Textbox(placeholder="Type the correct verb form here...", label="Your Answer")
-        submit = gr.Button("Submit")
-    restart = gr.Button("Restart")
+        user_input_textbox = gr.Textbox(
+            placeholder="Type the correct verb form here...", 
+            label="Your Answer",
+            show_label=False,
+            scale=3
+        )
+        submit_button = gr.Button("Submit", scale=1, variant="primary")
+    
+    restart_button = gr.Button("Restart")
 
-    demo.load(initial_llm, outputs=[msg, chatbot])
-    submit.click(llm_chatbot, [msg, chatbot], [msg, chatbot])
-    restart.click(reset_ui, outputs=[msg, chatbot])
+    submit_button.click(
+        fn=llm_chatbot, 
+        inputs=[user_input_textbox, chatbot_component], 
+        outputs=[user_input_textbox, chatbot_component]
+    )
+    restart_button.click(
+        fn=reset_chat, 
+        inputs=None, 
+        outputs=[user_input_textbox, chatbot_component]
+    )
 
-def main():
-    demo.launch()
-
+demo.queue()
 if __name__ == "__main__":
-    main()
+    demo.launch()
