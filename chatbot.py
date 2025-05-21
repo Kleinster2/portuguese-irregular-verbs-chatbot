@@ -175,6 +175,7 @@ def reset_chat():
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
     gr.Markdown("## Brazilian Portuguese Irregular Verb Trainer")
     gr.Markdown("Practice filling in the blanks with the correct verb form!")
+    gr.Markdown(f"This trainer focuses on the following irregular verbs: {', '.join(ALLOWED_IRREGULAR_VERB_ROOTS)}.")
     
     # Revert to using initial_llm for the value parameter
     # The hardcoded test for Chatbot value format is no longer needed here.
